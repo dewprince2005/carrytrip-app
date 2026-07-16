@@ -28,169 +28,157 @@ import {
   Briefcase,
   AlertCircle
 } from 'lucide-react';
+import { MapContainer, TileLayer, Marker, Polyline, useMap } from 'react-leaflet';
+import L from 'leaflet';
 
-const TrackingMap = ({ origin = '', destination = '', status }) => {
-  const getProgress = () => {
-    switch(status) {
-      case 'pending':
-      case 'accepted':
-        return 0;
-      case 'paid':
-        return 20;
-      case 'in_transit':
-        return 60;
-      case 'delivered':
-        return 100;
-      default:
-        return 0;
+const MapBoundsFitter = ({ originCoords, destCoords, liveLocation }) => {
+  const map = useMap();
+  useEffect(() => {
+    const points = [];
+    if (originCoords) points.push(originCoords);
+    if (destCoords) points.push(destCoords);
+    if (liveLocation) points.push(liveLocation);
+    
+    if (points.length > 1) {
+      const bounds = L.latLngBounds(points);
+      map.fitBounds(bounds, { padding: [30, 30] });
+    } else if (points.length === 1) {
+      map.flyTo(points[0], 12);
     }
+  }, [map, originCoords, destCoords, liveLocation]);
+  return null;
+};
+
+const TrackingMap = ({ bookingId, origin = '', destination = '', status }) => {
+  const [originCoords, setOriginCoords] = useState(null);
+  const [destCoords, setDestCoords] = useState(null);
+  const [liveLocation, setLiveLocation] = useState(null);
+  const [isStale, setIsStale] = useState(false);
+  const [etaText, setEtaText] = useState('Calculating...');
+
+  // Step 1: Geocode Origin and Destination
+  useEffect(() => {
+    const geocode = async (city, setter) => {
+      if (!city) return;
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(city)}`);
+        const data = await res.json();
+        if (data && data.length > 0) {
+          setter([parseFloat(data[0].lat), parseFloat(data[0].lon)]);
+        }
+      } catch (err) {
+        console.error("Geocoding error", err);
+      }
+    };
+    geocode(origin, setOriginCoords);
+    geocode(destination, setDestCoords);
+  }, [origin, destination]);
+
+  // Step 2: Subscribe to Realtime locations table
+  useEffect(() => {
+    if (!bookingId || status === 'delivered') return;
+
+    // Fetch initial latest location
+    const fetchLatest = async () => {
+      const { data } = await supabase.from('locations').select('*').eq('booking_id', bookingId).maybeSingle();
+      if (data) handleNewLocation(data);
+    };
+    fetchLatest();
+
+    // Subscribe
+    const channel = supabase.channel(`public:locations:booking_id=eq.${bookingId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'locations', filter: `booking_id=eq.${bookingId}` }, 
+        (payload) => handleNewLocation(payload.new)
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    }
+  }, [bookingId, status]);
+
+  const handleNewLocation = (loc) => {
+    setLiveLocation([loc.latitude, loc.longitude]);
+    const updatedTime = new Date(loc.updated_at).getTime();
+    const now = Date.now();
+    setIsStale(now - updatedTime > 60000); // 60s
   };
 
-  const progress = getProgress();
+  // Step 3: Calculate ETA
+  useEffect(() => {
+    if (liveLocation && destCoords) {
+      const [lat1, lon1] = liveLocation;
+      const [lat2, lon2] = destCoords;
+      const R = 6371; 
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      const d = R * c; 
+      
+      const speed = 40; 
+      const hours = d / speed;
+      const mins = Math.round(hours * 60);
+      if (mins < 1) setEtaText('Arriving soon');
+      else if (mins > 60) setEtaText(`${Math.floor(mins/60)}h ${mins%60}m`);
+      else setEtaText(`${mins}m`);
+    }
+  }, [liveLocation, destCoords]);
+
+  // Stepper logic
+  const steps = ['Pending', 'In Transit', 'Delivered'];
+  const currentStepIndex = status === 'pending' || status === 'paid' || status === 'accepted' ? 0 : status === 'in_transit' ? 1 : 2;
 
   return (
-    <div style={{ 
-      margin: 'var(--space-4) 0', 
-      padding: 'var(--space-4)', 
-      background: 'var(--bg-main)', 
-      border: '1px solid var(--border-color)', 
-      borderRadius: 'var(--radius-lg)',
-      position: 'relative',
-      overflow: 'hidden'
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-3)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: status === 'delivered' ? 'var(--success)' : status === 'in_transit' ? 'var(--primary)' : 'var(--warning)', display: 'inline-block' }}></span>
-          <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)', letterSpacing: '0.05em' }}>LIVE ROUTE TRACKER</span>
+    <div style={{ margin: 'var(--space-4) 0', background: 'var(--bg-main)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', overflow: 'hidden' }}>
+      {/* Stepper Header */}
+      <div style={{ padding: 'var(--space-3) var(--space-4)', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1 }}>
+          {steps.map((step, idx) => (
+            <div key={step} style={{ display: 'flex', alignItems: 'center', opacity: currentStepIndex >= idx ? 1 : 0.4 }}>
+              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: currentStepIndex >= idx ? 'var(--primary)' : 'var(--text-muted)' }} />
+              <span style={{ fontSize: '0.75rem', fontWeight: 600, marginLeft: '6px' }}>{step}</span>
+              {idx < 2 && <div style={{ width: '30px', height: '2px', backgroundColor: 'var(--text-muted)', margin: '0 8px' }} />}
+            </div>
+          ))}
         </div>
-        {status === 'in_transit' && (
-          <span style={{ 
-            fontSize: '0.7rem', 
-            color: 'var(--primary)', 
-            fontWeight: 600,
-            display: 'flex', 
-            alignItems: 'center', 
-            gap: '4px'
-          }}>
-            Live Transit Active
-          </span>
+        
+        {status === 'in_transit' && liveLocation && (
+          <div style={{ fontSize: '0.75rem', fontWeight: 600, color: isStale ? 'var(--warning)' : 'var(--success)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+            <Navigation size={12} /> {isStale ? 'Last known location' : 'Live ETA: ' + etaText}
+          </div>
         )}
       </div>
 
-      <svg viewBox="0 0 400 110" style={{ width: '100%', height: 'auto', display: 'block' }}>
-        <defs>
-          <pattern id="grid" width="16" height="16" patternUnits="userSpaceOnUse">
-            <path d="M 16 0 L 0 0 0 16" fill="none" stroke="rgba(0, 0, 0, 0.02)" strokeWidth="1"/>
-          </pattern>
-        </defs>
-        <rect width="100%" height="100%" fill="url(#grid)" rx="6" />
-
-        {/* Gray Route Path */}
-        <path 
-          d="M 60,55 Q 200,20 340,55" 
-          fill="none" 
-          stroke="rgba(0, 0, 0, 0.05)" 
-          strokeWidth="4" 
-          strokeLinecap="round"
-        />
-
-        {/* Neon Primary Progress Line */}
-        <path 
-          d="M 60,55 Q 200,20 340,55" 
-          fill="none" 
-          stroke="var(--primary)" 
-          strokeWidth="4" 
-          strokeDasharray="400"
-          strokeDashoffset={400 - (400 * progress / 100)}
-          strokeLinecap="round"
-          style={{ transition: 'stroke-dashoffset 1s ease-in-out' }}
-        />
-
-        {/* Dash Animation during Active Transit */}
-        {status === 'in_transit' && (
-          <path 
-            d="M 60,55 Q 200,20 340,55" 
-            fill="none" 
-            stroke="#ffffff" 
-            strokeWidth="2" 
-            strokeDasharray="8, 12"
-            strokeLinecap="round"
-            style={{ animation: 'dash 12s linear infinite' }}
-          />
+      {/* Leaflet Map */}
+      <div style={{ width: '100%', height: '250px', backgroundColor: '#e5e7eb' }}>
+        {(originCoords || destCoords) ? (
+          <MapContainer 
+            center={originCoords || destCoords} 
+            zoom={5} 
+            zoomControl={false}
+            style={{ width: '100%', height: '100%', zIndex: 0 }}
+          >
+            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+            
+            {originCoords && <Marker position={originCoords} opacity={0.6} />}
+            {destCoords && <Marker position={destCoords} opacity={0.6} />}
+            {liveLocation && status === 'in_transit' && (
+              <Marker position={liveLocation} zIndexOffset={1000} />
+            )}
+            
+            <MapBoundsFitter originCoords={originCoords} destCoords={destCoords} liveLocation={liveLocation} />
+          </MapContainer>
+        ) : (
+          <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>Loading route map...</div>
         )}
-
-        {/* Origin pin marker */}
-        <g transform="translate(60, 55)">
-          <circle r="7" fill="var(--bg-surface)" stroke="var(--primary)" strokeWidth="2" />
-          <circle r="3" fill="var(--primary)" />
-          <text y="-14" textAnchor="middle" fill="var(--text-primary)" fontSize="9" fontWeight="600">{(origin || '').split(',')[0]}</text>
-        </g>
-
-        {/* Destination pin marker */}
-        <g transform="translate(340, 55)">
-          <circle r="7" fill="var(--bg-surface)" stroke={progress === 100 ? "var(--success)" : "rgba(0, 0, 0, 0.15)"} strokeWidth="2" />
-          <circle r="3" fill={progress === 100 ? "var(--success)" : "var(--text-muted)"} />
-          <text y="-14" textAnchor="middle" fill="var(--text-primary)" fontSize="9" fontWeight="600">{(destination || '').split(',')[0]}</text>
-        </g>
-
-        {/* Pulsing and moving courier agent */}
-        {status === 'in_transit' && (
-          <g>
-            <circle r="10" fill="var(--primary)" opacity="0.3">
-              <animateMotion dur="5s" repeatCount="indefinite" path="M 60,55 Q 200,20 340,55" />
-            </circle>
-            <circle r="5" fill="var(--primary)">
-              <animateMotion dur="5s" repeatCount="indefinite" path="M 60,55 Q 200,20 340,55" />
-            </circle>
-          </g>
-        )}
-      </svg>
+      </div>
     </div>
   );
 };
 
-// =========================================================================
-// GOOGLE MAPS EMBEDDED VISUALIZER
-// =========================================================================
-const GoogleMapVisualizer = ({ origin, destination }) => {
-  if (!origin && !destination) return null;
 
-  const mapUrl = (origin && destination)
-    ? `https://maps.google.com/maps?saddr=${encodeURIComponent(origin)}&daddr=${encodeURIComponent(destination)}&t=&z=13&ie=UTF8&iwloc=&output=embed`
-    : `https://maps.google.com/maps?q=${encodeURIComponent(origin || destination)}&t=&z=13&ie=UTF8&iwloc=&output=embed`;
-
-  const externalMapDirectionUrl = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin || '')}&destination=${encodeURIComponent(destination || '')}`;
-
-  return (
-    <div style={{ margin: '15px 0', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', overflow: 'hidden' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'var(--bg-main)', padding: '10px 15px', borderBottom: '1px solid var(--border-color)' }}>
-        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <MapPin size={14} style={{ color: 'var(--primary)' }} /> Live Google Maps Navigation
-        </span>
-        <a 
-          href={externalMapDirectionUrl} 
-          target="_blank" 
-          rel="noopener noreferrer"
-          className="btn btn-outline btn-3d"
-          style={{ padding: '4px 10px', fontSize: '0.75rem', height: 'auto', display: 'inline-flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
-        >
-          Open in Google Maps
-        </a>
-      </div>
-      <div style={{ width: '100%', height: '220px', backgroundColor: '#e5e7eb' }}>
-        <iframe
-          title="Google Map Directions"
-          width="100%"
-          height="100%"
-          frameBorder="0"
-          style={{ border: 0 }}
-          src={mapUrl}
-          allowFullScreen
-        ></iframe>
-      </div>
-    </div>
-  );
-};
+// Google Map Visualizer Removed
 
 // =========================================================================
 // LOCATION AUTOCOMPLETE INPUT COMPONENT
@@ -323,6 +311,16 @@ const LocationInput = ({ value, onChange, placeholder, icon }) => {
   );
 };
 
+const loadRazorpayScript = () => {
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+};
+
 const Dashboard = () => {
   const { user, profile, logout, refreshProfile } = useAuth();
   const navigate = useNavigate();
@@ -390,18 +388,75 @@ const Dashboard = () => {
     }
   }, [user, activeTab]);
 
+  // Geolocation watch ID ref
+  const watchIdRef = useRef(null);
+
+  // Live Carrier Geolocation Tracking
+  useEffect(() => {
+    if (!user) return;
+    
+    const activeDeliveries = myDeliveries.filter(b => b.status === 'in_transit');
+    
+    if (activeDeliveries.length > 0) {
+      if (!watchIdRef.current) {
+        if ("geolocation" in navigator) {
+          watchIdRef.current = navigator.geolocation.watchPosition(
+            async (position) => {
+              const { latitude, longitude } = position.coords;
+              
+              // Upsert location for each active booking
+              for (const booking of activeDeliveries) {
+                await supabase.from('locations').upsert({
+                  booking_id: booking.id,
+                  carrier_id: user.id,
+                  latitude,
+                  longitude,
+                  updated_at: new Date().toISOString()
+                }, { onConflict: 'booking_id' });
+              }
+            },
+            (error) => {
+              console.error("Geolocation error:", error.message);
+            },
+            {
+              enableHighAccuracy: true,
+              timeout: 10000,
+              maximumAge: 0
+            }
+          );
+        }
+      }
+    } else {
+      // Clear watch if no active deliveries
+      if (watchIdRef.current) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    }
+
+    return () => {
+      // Cleanup on unmount
+      if (watchIdRef.current) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    }
+  }, [myDeliveries, user]);
+
   const fetchData = async () => {
     setLoading(true);
     setErrorMessage('');
     try {
       if (activeTab === 'find_travelers') {
         await fetchAvailableRoutes();
-      } else if (activeTab === 'my_shipments') {
+      } else if (activeTab === 'my_shipments' || activeTab === 'sender_history') {
         await fetchMyShipments();
       } else if (activeTab === 'post_route') {
         await fetchMyRoutes();
       } else if (activeTab === 'my_deliveries') {
         await fetchMyDeliveries();
+      } else if (activeTab === 'carrier_analytics') {
+        await Promise.all([fetchMyDeliveries(), fetchMyRoutes()]);
       } else if (activeTab === 'admin_panel') {
         await fetchAdminData();
       }
@@ -495,16 +550,45 @@ const Dashboard = () => {
     setSuccessMessage('');
     try {
       // Only update name and phone — roles are fixed and managed by admin only
-      const { error } = await supabase
+      const { data, error } = await supabase
         .from('profiles')
-        .update({
-          name: profileName,
+        .upsert({
+          id: user.id,
+          name: profileName || user?.user_metadata?.full_name || 'User',
           phone: profilePhone,
-        })
-        .eq('id', user.id);
+          roles: profileRoles, // preserve existing roles or empty
+        }, { onConflict: 'id' })
+        .select()
+        .single();
 
       if (error) throw error;
       setSuccessMessage('Profile updated successfully!');
+      await refreshProfile();
+    } catch (err) {
+      setErrorMessage(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpdateRole = async (newRole) => {
+    setLoading(true);
+    setErrorMessage('');
+    setSuccessMessage('');
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .upsert({
+          id: user.id,
+          name: profile?.name || user?.user_metadata?.full_name || 'User',
+          phone: profile?.phone || '',
+          roles: [newRole],
+        }, { onConflict: 'id' })
+        .select()
+        .single();
+
+      if (error) throw error;
+      setSuccessMessage(`Account role updated to ${newRole}!`);
       await refreshProfile();
     } catch (err) {
       setErrorMessage(err.message);
@@ -647,25 +731,90 @@ const Dashboard = () => {
     }
   };
 
-  const handleSimulatePayment = async (e) => {
-    e.preventDefault();
+  const handleRazorpayPayment = async (e) => {
+    if (e) e.preventDefault();
     if (!selectedBookingForPayment) return;
+    
     setLoading(true);
     setErrorMessage('');
 
     try {
-      const { error } = await supabase
-        .from('bookings')
-        .update({ status: 'paid' })
-        .eq('id', selectedBookingForPayment.id);
+      // 1. Load Razorpay script
+      const res = await loadRazorpayScript();
+      if (!res) {
+        throw new Error('Razorpay SDK failed to load. Are you online?');
+      }
 
-      if (error) throw error;
-      setSuccessMessage('Payment secured in Escrow! Share Pickup OTP with carrier.');
-      setShowPaymentModal(false);
-      setSelectedBookingForPayment(null);
-      setPaymentForm({ cardNumber: '', expiry: '', cvv: '', cardholder: '' });
-      await fetchMyShipments();
+      // 2. Calculate Total Amount
+      const PLATFORM_FEE_PCT = 0.10;
+      const totalAmount = parseFloat(selectedBookingForPayment.price);
+
+      // 3. Create Order via Edge Function
+      const { data: orderData, error: orderError } = await supabase.functions.invoke('razorpay-create-order', {
+        body: { 
+          amount: totalAmount, 
+          receipt: `rcpt_${selectedBookingForPayment.id.slice(0,8)}` 
+        }
+      });
+
+      if (orderError) throw orderError;
+      if (orderData.error) throw new Error(orderData.error);
+
+      // 4. Open Razorpay Checkout Modal
+      const options = {
+        key: import.meta.env.VITE_RAZORPAY_KEY_ID,
+        amount: orderData.amount,
+        currency: orderData.currency,
+        name: "Carrytrip Escrow",
+        description: `Escrow payment for ${selectedBookingForPayment.title}`,
+        order_id: orderData.id,
+        handler: async function (response) {
+          try {
+            // 5. Verify signature via Edge Function on success
+            setLoading(true);
+            const { data: verifyData, error: verifyError } = await supabase.functions.invoke('razorpay-verify-signature', {
+              body: {
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+                booking_id: selectedBookingForPayment.id
+              }
+            });
+
+            if (verifyError) throw verifyError;
+            if (verifyData.error) throw new Error(verifyData.error);
+
+            setSuccessMessage('Payment secured in Escrow! Share Pickup OTP with carrier.');
+            setShowPaymentModal(false);
+            setSelectedBookingForPayment(null);
+            await fetchMyShipments();
+          } catch (verifyErr) {
+            console.error(verifyErr);
+            setErrorMessage(`Payment verification failed: ${verifyErr.message}`);
+          } finally {
+            setLoading(false);
+          }
+        },
+        prefill: {
+          name: profile?.name || user?.user_metadata?.full_name || '',
+          email: user?.email || '',
+          contact: profile?.phone || ''
+        },
+        theme: {
+          color: "#0f766e"
+        }
+      };
+
+      const paymentObject = new window.Razorpay(options);
+      
+      paymentObject.on('payment.failed', function (response) {
+        setErrorMessage(`Payment failed: ${response.error.description}`);
+      });
+
+      paymentObject.open();
+
     } catch (err) {
+      console.error(err);
       setErrorMessage(err.message);
     } finally {
       setLoading(false);
@@ -674,8 +823,15 @@ const Dashboard = () => {
 
   const handleVerifyOtp = async (booking, type) => {
     const enteredOtp = otpInputs[booking.id]?.value;
+    const uploadedFile = otpInputs[booking.id]?.file;
+
     if (!enteredOtp) {
       setErrorMessage('Please enter the OTP first.');
+      return;
+    }
+
+    if (type === 'delivery' && !uploadedFile) {
+      setErrorMessage('Please upload a proof of delivery photo to release escrow funds.');
       return;
     }
 
@@ -687,10 +843,33 @@ const Dashboard = () => {
         throw new Error('Invalid OTP! Verify code details with sender/receiver.');
       }
 
+      let photoUrl = null;
+      if (type === 'delivery' && uploadedFile) {
+        const fileExt = uploadedFile.name.split('.').pop();
+        const fileName = `${booking.id}-${Date.now()}.${fileExt}`;
+        const { data: uploadData, error: uploadError } = await supabase.storage
+          .from('proof_of_delivery')
+          .upload(fileName, uploadedFile);
+        
+        if (uploadError) throw new Error('Failed to upload proof of delivery photo: ' + uploadError.message);
+        
+        const { data: publicUrlData } = supabase.storage
+          .from('proof_of_delivery')
+          .getPublicUrl(fileName);
+          
+        photoUrl = publicUrlData.publicUrl;
+      }
+
       const nextStatus = type === 'pickup' ? 'in_transit' : 'delivered';
+      const nextPaymentStatus = type === 'delivery' ? 'released' : booking.payment_status;
+
+      const updateData = { status: nextStatus };
+      if (photoUrl) updateData.proof_of_delivery_photo_url = photoUrl;
+      if (nextPaymentStatus) updateData.payment_status = nextPaymentStatus;
+
       const { error } = await supabase
         .from('bookings')
-        .update({ status: nextStatus })
+        .update(updateData)
         .eq('id', booking.id);
 
       if (error) throw error;
@@ -698,10 +877,14 @@ const Dashboard = () => {
       if (nextStatus === 'in_transit') {
         setSuccessMessage('Pickup OTP verified successfully! Job is in transit.');
       } else {
-        setSuccessMessage('Delivery drop-off OTP verified! Escrow funds released to carrier wallet.');
+        setSuccessMessage('Delivery drop-off OTP and Photo verified! Escrow funds released to your wallet.');
       }
       
-      setOtpInputs(prev => ({ ...prev, [booking.id]: { type: '', value: '' } }));
+      setOtpInputs(prev => {
+        const next = {...prev};
+        delete next[booking.id];
+        return next;
+      });
       await fetchMyDeliveries();
     } catch (err) {
       setErrorMessage(err.message);
@@ -716,7 +899,7 @@ const Dashboard = () => {
       accepted: { bg: 'rgba(79, 70, 229, 0.1)', color: 'var(--primary)', label: 'Awaiting Payment' },
       paid: { bg: 'rgba(6, 182, 212, 0.1)', color: '#0891b2', label: 'Escrow Secured' },
       in_transit: { bg: 'var(--secondary-glow)', color: 'var(--secondary)', label: 'In Transit' },
-      delivered: { bg: 'var(--success-glow)', color: 'var(--success)', label: 'Delivered (Released)' },
+      delivered: { bg: 'var(--success-glow)', color: 'var(--success)', label: 'Delivered' },
       cancelled: { bg: 'var(--danger-glow)', color: 'var(--danger)', label: 'Cancelled' }
     };
     const s = styles[status] || { bg: 'rgba(0,0,0,0.05)', color: 'var(--text-muted)', label: status };
@@ -735,6 +918,15 @@ const Dashboard = () => {
     );
   };
 
+  const getEscrowBadge = (paymentStatus) => {
+    switch (paymentStatus) {
+      case 'pending': return null; 
+      case 'held': return <span style={{ marginLeft: '8px', display: 'inline-block', padding: '2px 8px', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--warning-glow)', color: 'var(--warning)', fontSize: '0.75rem', fontWeight: 600 }}><Lock size={12} style={{marginRight: '4px'}}/> Escrow Locked</span>;
+      case 'released': return <span style={{ marginLeft: '8px', display: 'inline-block', padding: '2px 8px', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--success-glow)', color: 'var(--success)', fontSize: '0.75rem', fontWeight: 600 }}><CheckCircle size={12} style={{marginRight: '4px'}}/> Funds Released</span>;
+      default: return null;
+    }
+  };
+
   const filteredRoutes = (routes || []).filter(r => {
     const originText = r.origin || '';
     const destText = r.destination || '';
@@ -744,22 +936,21 @@ const Dashboard = () => {
   });
 
   return (
-    <div className="perspective-container" style={{ display: 'flex', minHeight: '100vh', backgroundColor: 'var(--bg-main)', overflowX: 'hidden' }}>
+    <div style={{ display: 'flex', width: '100vw', height: '100dvh', overflow: 'hidden', backgroundColor: 'var(--bg-main)' }}>
       
       {/* ========================================================================= */}
       {/* LEFT SIDEBAR NAVIGATION                                                    */}
       {/* ========================================================================= */}
       <aside style={{ 
         width: '260px', 
+        minWidth: '260px',
+        flexShrink: 0,
         backgroundColor: 'var(--bg-surface)', 
         borderRight: '1px solid var(--border-color)', 
         display: 'flex', 
         flexDirection: 'column',
-        position: 'sticky',
-        top: 0,
-        height: '100vh',
-        zIndex: 10,
-        transformStyle: 'preserve-3d'
+        height: '100%',
+        overflowY: 'auto'
       }}>
         {/* Brand Logo Header */}
         <div style={{ padding: 'var(--space-6) var(--space-5)', borderBottom: '1px solid var(--border-color)' }}>
@@ -768,39 +959,61 @@ const Dashboard = () => {
         </div>
 
         {/* Navigation Tabs */}
-        <nav style={{ padding: 'var(--space-4) var(--space-2)', flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <nav style={{ padding: 'var(--space-4) var(--space-2)', flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '6px' }}>
           
-          <div style={{ padding: '0 var(--space-3) var(--space-1)', fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>SENDER CHANNELS</div>
-          <button 
-            onClick={() => setActiveTab('find_travelers')} 
-            className={`btn sidebar-btn-3d btn-3d ${activeTab === 'find_travelers' ? 'btn-primary active' : 'btn-outline'}`}
-            style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'find_travelers' ? undefined : 'transparent' }}
-          >
-            <Compass size={18} /> Find Travelers
-          </button>
-          <button 
-            onClick={() => setActiveTab('my_shipments')} 
-            className={`btn sidebar-btn-3d btn-3d ${activeTab === 'my_shipments' ? 'btn-primary active' : 'btn-outline'}`}
-            style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'my_shipments' ? undefined : 'transparent', marginBottom: 'var(--space-4)' }}
-          >
-            <Send size={18} /> My Sent Parcels
-          </button>
+          {((profileRoles || []).includes('sender') || (profileRoles || []).length === 0) && (
+            <>
+              <div style={{ padding: '0 var(--space-3) var(--space-1)', fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>SENDER CHANNELS</div>
+              <button 
+                onClick={() => navigate('/search')} 
+                className={`btn sidebar-btn-3d btn-3d btn-outline`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: 'transparent' }}
+              >
+                <Compass size={18} /> Find Travelers
+              </button>
+              <button 
+                onClick={() => setActiveTab('my_shipments')} 
+                className={`btn sidebar-btn-3d btn-3d ${activeTab === 'my_shipments' ? 'btn-primary active' : 'btn-outline'}`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'my_shipments' ? undefined : 'transparent' }}
+              >
+                <Send size={18} /> My Sent Parcels
+              </button>
+              <button 
+                onClick={() => setActiveTab('sender_history')} 
+                className={`btn sidebar-btn-3d btn-3d ${activeTab === 'sender_history' ? 'btn-primary active' : 'btn-outline'}`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'sender_history' ? undefined : 'transparent', marginBottom: 'var(--space-4)' }}
+              >
+                <Clock size={18} /> Parcel History
+              </button>
+            </>
+          )}
 
-          <div style={{ padding: '0 var(--space-3) var(--space-1)', fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>CARRIER CHANNELS</div>
-          <button 
-            onClick={() => setActiveTab('post_route')} 
-            className={`btn sidebar-btn-3d btn-3d ${activeTab === 'post_route' ? 'btn-secondary active' : 'btn-outline'}`}
-            style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'post_route' ? undefined : 'transparent', color: activeTab === 'post_route' ? '#ffffff' : 'var(--text-primary)' }}
-          >
-            <Navigation size={18} /> List a Journey
-          </button>
-          <button 
-            onClick={() => setActiveTab('my_deliveries')} 
-            className={`btn sidebar-btn-3d btn-3d ${activeTab === 'my_deliveries' ? 'btn-secondary active' : 'btn-outline'}`}
-            style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'my_deliveries' ? undefined : 'transparent', color: activeTab === 'my_deliveries' ? '#ffffff' : 'var(--text-primary)', marginBottom: 'var(--space-4)' }}
-          >
-            <Briefcase size={18} /> Delivery Jobs
-          </button>
+          {((profileRoles || []).includes('carrier') || (profileRoles || []).length === 0) && (
+            <>
+              <div style={{ padding: '0 var(--space-3) var(--space-1)', fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>CARRIER CHANNELS</div>
+              <button 
+                onClick={() => setActiveTab('post_route')} 
+                className={`btn sidebar-btn-3d btn-3d ${activeTab === 'post_route' ? 'btn-secondary active' : 'btn-outline'}`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'post_route' ? undefined : 'transparent', color: activeTab === 'post_route' ? '#ffffff' : 'var(--text-primary)' }}
+              >
+                <Navigation size={18} /> List a Journey
+              </button>
+              <button 
+                onClick={() => setActiveTab('my_deliveries')} 
+                className={`btn sidebar-btn-3d btn-3d ${activeTab === 'my_deliveries' ? 'btn-secondary active' : 'btn-outline'}`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'my_deliveries' ? undefined : 'transparent', color: activeTab === 'my_deliveries' ? '#ffffff' : 'var(--text-primary)' }}
+              >
+                <Briefcase size={18} /> Delivery Jobs
+              </button>
+              <button 
+                onClick={() => setActiveTab('carrier_analytics')} 
+                className={`btn sidebar-btn-3d btn-3d ${activeTab === 'carrier_analytics' ? 'btn-secondary active' : 'btn-outline'}`}
+                style={{ justifyContent: 'flex-start', padding: '10px var(--space-3)', fontSize: '0.9rem', border: 'none', background: activeTab === 'carrier_analytics' ? undefined : 'transparent', color: activeTab === 'carrier_analytics' ? '#ffffff' : 'var(--text-primary)', marginBottom: 'var(--space-4)' }}
+              >
+                <DollarSign size={18} /> Earnings & Analytics
+              </button>
+            </>
+          )}
 
           <div style={{ padding: '0 var(--space-3) var(--space-1)', fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>ACCOUNT</div>
           <button 
@@ -853,10 +1066,10 @@ const Dashboard = () => {
       {/* ========================================================================= */}
       {/* RIGHT SIDE MAIN CONTAINER                                                 */}
       {/* ========================================================================= */}
-      <div style={{ flexGrow: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div style={{ flexGrow: 1, minWidth: 0, height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
         
         {/* Main Content Dashboard */}
-        <main style={{ padding: 'var(--space-8) var(--space-6)', flexGrow: 1, perspective: '1000px' }}>
+        <main style={{ padding: 'var(--space-8) var(--space-6)', flexGrow: 1, perspective: '1000px', minHeight: 0 }}>
           
           {/* Notification Messages */}
           {errorMessage && (
@@ -960,9 +1173,8 @@ const Dashboard = () => {
                             </button>
                           )}
                         </div>
-
-                        {/* Interactive Google Map embed for traveler paths */}
-                        <GoogleMapVisualizer origin={route.origin} destination={route.destination} />
+                        {/* Route map for traveler paths */}
+                        <TrackingMap origin={route.origin} destination={route.destination} status="pending" />
                       </div>
                     ))}
                   </div>
@@ -1011,11 +1223,8 @@ const Dashboard = () => {
                           </div>
                         )}
 
-                        {/* Interactive Google Map navigation */}
-                        <GoogleMapVisualizer origin={booking.origin} destination={booking.destination} />
-
                         {/* Simple Route SVG progress bar */}
-                        <TrackingMap origin={booking.origin} destination={booking.destination} status={booking.status} />
+                        <TrackingMap bookingId={booking.id} origin={booking.origin} destination={booking.destination} status={booking.status} />
 
                         <div style={{ marginTop: 'var(--space-3)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-2)' }}>
                           <div>
@@ -1371,7 +1580,7 @@ const Dashboard = () => {
                                 </div>
                               )}
 
-                              <GoogleMapVisualizer origin={route.origin} destination={route.destination} />
+                              <TrackingMap origin={route.origin} destination={route.destination} status="pending" />
                             </div>
                           );
                         })}
@@ -1424,8 +1633,8 @@ const Dashboard = () => {
                           </div>
                         )}
 
-                        {/* Google Maps Visualizer */}
-                        <GoogleMapVisualizer origin={booking.origin} destination={booking.destination} />
+                        {/* Tracking Map */}
+                        <TrackingMap origin={booking.origin} destination={booking.destination} status={booking.status} />
 
                         <div style={{ display: 'flex', gap: 'var(--space-4)' }}>
                           <button 
@@ -1465,7 +1674,10 @@ const Dashboard = () => {
                             <h4 className="card-title" style={{ margin: 0 }}>{booking.title}</h4>
                             <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Route: {booking.origin} to {booking.destination}</span>
                           </div>
-                          <div>{getStatusBadge(booking.status)}</div>
+                          <div>
+                            {getStatusBadge(booking.status)}
+                            {getEscrowBadge(booking.payment_status)}
+                          </div>
                         </div>
 
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', fontSize: '0.85rem', color: 'var(--text-secondary)', padding: '10px 0', borderTop: '1px solid var(--border-color)', borderBottom: '1px solid var(--border-color)' }}>
@@ -1484,11 +1696,8 @@ const Dashboard = () => {
                           </div>
                         )}
 
-                        {/* Google Maps Visualizer */}
-                        <GoogleMapVisualizer origin={booking.origin} destination={booking.destination} />
-
                         {/* Tracking route map */}
-                        <TrackingMap origin={booking.origin} destination={booking.destination} status={booking.status} />
+                        <TrackingMap bookingId={booking.id} origin={booking.origin} destination={booking.destination} status={booking.status} />
 
                         {/* OTP Verification Forms */}
                         <div style={{ marginTop: '15px' }}>
@@ -1518,25 +1727,39 @@ const Dashboard = () => {
                           )}
 
                           {booking.status === 'in_transit' && (
-                            <div>
-                              <label className="form-label" style={{ color: 'var(--secondary)' }}>Verify Drop-off Delivery OTP</label>
-                              <div style={{ display: 'flex', gap: '10px' }}>
+                            <div style={{ backgroundColor: 'var(--bg-main)', padding: '16px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
+                              <label className="form-label" style={{ color: 'var(--secondary)', marginBottom: '12px' }}>Verify Drop-off Delivery OTP & Upload Proof</label>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                                 <input 
                                   type="text" 
                                   maxLength="4" 
-                                  placeholder="Enter 4-digit code" 
+                                  placeholder="Enter 4-digit OTP" 
                                   value={otpInputs[booking.id]?.value || ''}
-                                  onChange={(e) => setOtpInputs({ ...otpInputs, [booking.id]: { type: 'delivery', value: e.target.value } })}
+                                  onChange={(e) => setOtpInputs({ ...otpInputs, [booking.id]: { ...otpInputs[booking.id], type: 'delivery', value: e.target.value } })}
                                   className="form-input" 
                                   style={{ maxWidth: '200px', letterSpacing: '4px', textAlign: 'center', fontWeight: 'bold' }} 
                                 />
+                                <div>
+                                  <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Proof of Delivery Photo (Required)</label>
+                                  <input 
+                                    type="file" 
+                                    accept="image/*"
+                                    onChange={(e) => {
+                                      if (e.target.files && e.target.files[0]) {
+                                        setOtpInputs({ ...otpInputs, [booking.id]: { ...otpInputs[booking.id], type: 'delivery', file: e.target.files[0] } });
+                                      }
+                                    }}
+                                    className="form-input" 
+                                    style={{ maxWidth: '300px' }} 
+                                  />
+                                </div>
                                 <button 
                                   onClick={() => handleVerifyOtp(booking, 'delivery')}
                                   className="btn btn-secondary btn-3d" 
-                                  style={{ width: 'auto', color: '#ffffff' }}
+                                  style={{ width: 'fit-content', color: '#ffffff' }}
                                   disabled={loading}
                                 >
-                                  Confirm Drop-off
+                                  {loading ? <RefreshCw className="spinner" size={16} /> : 'Confirm Drop-off & Release Funds'}
                                 </button>
                               </div>
                             </div>
@@ -1555,70 +1778,208 @@ const Dashboard = () => {
               </div>
             )}
 
-            {/* TAB E: PROFILE SETTINGS */}
-            {activeTab === 'profile_settings' && (
-              <div style={{ maxWidth: '600px' }}>
-                <h2 className="section-title">Profile Settings</h2>
-                <p className="subtitle">Update your personal details. Your role is fixed at signup.</p>
+            {/* NEW TAB: SENDER HISTORY */}
+            {activeTab === 'sender_history' && (
+              <div>
+                <h2 className="section-title">Parcel History</h2>
+                <p className="subtitle">View your past completed or cancelled shipments.</p>
+                {myShipments.filter(b => b.status === 'delivered' || b.status === 'cancelled').length === 0 ? (
+                  <div className="card-3d" style={{ textAlign: 'center', padding: 'var(--space-12)', backgroundColor: 'var(--bg-surface)' }}>
+                    <Clock size={40} style={{ color: 'var(--text-muted)', marginBottom: 'var(--space-4)' }} />
+                    <p style={{ color: 'var(--text-secondary)' }}>You don't have any past shipments in history.</p>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}>
+                    {myShipments.filter(b => b.status === 'delivered' || b.status === 'cancelled').map((booking) => (
+                      <div key={booking.id} className="card-3d card-3d-stacked" style={{ borderLeft: `4px solid ${booking.status === 'delivered' ? 'var(--success)' : 'var(--danger)'}`, backgroundColor: 'var(--bg-surface)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-2)' }}>
+                          <div>
+                            <h4 className="card-title" style={{ margin: 0 }}>{booking.title}</h4>
+                            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                              Transit: {booking.origin} to {booking.destination}
+                            </div>
+                          </div>
+                          <div>{getStatusBadge(booking.status)}</div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 'var(--space-4)', fontSize: '0.9rem', color: 'var(--text-secondary)', padding: 'var(--space-3) 0', borderTop: '1px solid var(--border-color)', marginTop: 'var(--space-3)' }}>
+                          <div><strong>Weight:</strong> {booking.weight} kg</div>
+                          <div><strong>Cost:</strong> ₹{booking.price}</div>
+                          <div><strong>Carrier:</strong> {booking.carrier?.name || 'N/A'}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
-                {/* Account Role Display (read-only) */}
-                <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', marginBottom: '20px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <div style={{ width: '38px', height: '38px', borderRadius: '50%', background: 'var(--primary-glow)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.1rem' }}>
-                        👤
-                      </div>
-                      <div>
-                        <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{profile?.name || 'User'}</div>
-                        <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>{user?.email}</div>
-                      </div>
-                    </div>
-                    <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                      {(profileRoles || []).length === 0 && (
-                        <span style={{ padding: '4px 12px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 600, background: 'rgba(100,100,120,0.2)', color: 'var(--text-secondary)', border: '1px solid rgba(100,100,120,0.3)' }}>No Role</span>
-                      )}
-                      {(profileRoles || []).includes('sender') && (
-                        <span style={{ padding: '4px 12px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 700, background: 'rgba(79,70,229,0.15)', color: 'var(--primary)', border: '1px solid rgba(79,70,229,0.35)' }}>📦 Sender</span>
-                      )}
-                      {(profileRoles || []).includes('carrier') && (
-                        <span style={{ padding: '4px 12px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 700, background: 'rgba(16,185,129,0.15)', color: '#10b981', border: '1px solid rgba(16,185,129,0.35)' }}>🚀 Carrier</span>
-                      )}
-                      {(profileRoles || []).includes('admin') && (
-                        <span style={{ padding: '4px 12px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 700, background: 'rgba(239,68,68,0.15)', color: 'var(--danger)', border: '1px solid rgba(239,68,68,0.35)' }}>🛡️ Admin</span>
-                      )}
+            {/* NEW TAB: CARRIER ANALYTICS */}
+            {activeTab === 'carrier_analytics' && (
+              <div>
+                <h2 className="section-title">Earnings & Analytics</h2>
+                <p className="subtitle">Track your delivery performance and generated revenue.</p>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 'var(--space-4)', marginBottom: 'var(--space-6)' }}>
+                  <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', borderTop: '4px solid var(--success)' }}>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>TOTAL EARNINGS</div>
+                    <div style={{ fontSize: '2rem', fontWeight: 800, marginTop: '5px', color: 'var(--success)' }}>
+                      ₹{myDeliveries.filter(b => b.status === 'delivered').reduce((acc, curr) => acc + parseFloat(curr.price || 0), 0).toFixed(0)}
                     </div>
                   </div>
-                  <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '12px', padding: '8px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', borderLeft: '3px solid var(--primary)' }}>
-                    ℹ️ Your role was assigned when you signed up and can only be changed by an administrator.
-                  </p>
+                  <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', borderTop: '4px solid var(--secondary)' }}>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>DELIVERED PARCELS</div>
+                    <div style={{ fontSize: '2rem', fontWeight: 800, marginTop: '5px' }}>
+                      {myDeliveries.filter(b => b.status === 'delivered').length}
+                    </div>
+                  </div>
+                  <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', borderTop: '4px solid var(--info)' }}>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>ACTIVE ROUTES</div>
+                    <div style={{ fontSize: '2rem', fontWeight: 800, marginTop: '5px' }}>
+                      {myRoutes.length}
+                    </div>
+                  </div>
+                </div>
+                
+                <h3 className="section-title" style={{ fontSize: '1.15rem' }}>Recent Earnings</h3>
+                {myDeliveries.filter(b => b.status === 'delivered').length === 0 ? (
+                  <div className="card-3d" style={{ textAlign: 'center', padding: 'var(--space-12)', backgroundColor: 'var(--bg-surface)' }}>
+                    <DollarSign size={40} style={{ color: 'var(--text-muted)', marginBottom: 'var(--space-4)' }} />
+                    <p style={{ color: 'var(--text-secondary)' }}>No completed deliveries yet to show earnings.</p>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+                    {myDeliveries.filter(b => b.status === 'delivered').map((booking) => (
+                      <div key={booking.id} className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <h4 style={{ margin: 0, fontSize: '1rem' }}>{booking.title}</h4>
+                          <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{new Date(booking.created_at).toLocaleDateString()} • {booking.origin} ➔ {booking.destination}</div>
+                        </div>
+                        <div style={{ fontWeight: 800, color: 'var(--success)', fontSize: '1.1rem' }}>+ ₹{booking.price}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* TAB E: PROFILE SETTINGS */}
+            {activeTab === 'profile_settings' && (
+              <div style={{ maxWidth: '800px', margin: '0 auto', width: '100%' }}>
+                <div style={{ textAlign: 'center', marginBottom: 'var(--space-8)' }}>
+                  <h2 className="section-title" style={{ fontSize: '2rem', marginBottom: '8px' }}>Account Settings</h2>
+                  <p className="subtitle" style={{ fontSize: '1rem' }}>Manage your personal information and account preferences.</p>
+                </div>
+
+                {/* Account Role Display */}
+                <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', padding: 'var(--space-6)', marginBottom: 'var(--space-6)', border: '1px solid var(--border-color)' }}>
+                  <h3 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 'var(--space-4)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <ShieldAlert size={20} style={{ color: 'var(--primary)' }} /> Account Role
+                  </h3>
+                  
+                  {(!profileRoles || profileRoles.length === 0) ? (
+                    <div style={{ padding: 'var(--space-6)', backgroundColor: 'rgba(245,158,11,0.05)', borderRadius: 'var(--radius-lg)', border: '1px dashed #f59e0b', textAlign: 'center' }}>
+                      <AlertCircle size={32} style={{ color: '#f59e0b', margin: '0 auto var(--space-3)' }} />
+                      <h4 style={{ color: '#f59e0b', fontSize: '1.1rem', marginBottom: '8px' }}>Action Required: Select Your Role</h4>
+                      <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: 'var(--space-5)' }}>
+                        You haven't selected an account role yet. Please choose whether you want to send packages or carry them. This defines your primary dashboard experience.
+                      </p>
+                      <div style={{ display: 'flex', gap: 'var(--space-4)', justifyContent: 'center', flexWrap: 'wrap' }}>
+                        <button 
+                          onClick={() => handleUpdateRole('sender')}
+                          disabled={loading}
+                          className="btn btn-primary btn-3d" 
+                          style={{ minWidth: '160px' }}
+                        >
+                          <Send size={16} /> I am a Sender
+                        </button>
+                        <button 
+                          onClick={() => handleUpdateRole('carrier')}
+                          disabled={loading}
+                          className="btn btn-secondary btn-3d" 
+                          style={{ minWidth: '160px', color: 'white' }}
+                        >
+                          <Briefcase size={16} /> I am a Carrier
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 'var(--space-4)', backgroundColor: 'var(--bg-main)', borderRadius: 'var(--radius-md)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <div style={{ width: '48px', height: '48px', borderRadius: '50%', background: 'var(--primary-glow)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.5rem' }}>
+                          👤
+                        </div>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: '1.1rem' }}>{profile?.name || 'User'}</div>
+                          <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{user?.email}</div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        {profileRoles.includes('sender') && (
+                          <span style={{ padding: '6px 16px', borderRadius: '999px', fontSize: '0.85rem', fontWeight: 700, background: 'rgba(79,70,229,0.15)', color: 'var(--primary)', border: '1px solid rgba(79,70,229,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <Send size={14} /> Sender
+                          </span>
+                        )}
+                        {profileRoles.includes('carrier') && (
+                          <span style={{ padding: '6px 16px', borderRadius: '999px', fontSize: '0.85rem', fontWeight: 700, background: 'rgba(16,185,129,0.15)', color: '#10b981', border: '1px solid rgba(16,185,129,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <Navigation size={14} /> Carrier
+                          </span>
+                        )}
+                        {profileRoles.includes('admin') && (
+                          <span style={{ padding: '6px 16px', borderRadius: '999px', fontSize: '0.85rem', fontWeight: 700, background: 'rgba(239,68,68,0.15)', color: 'var(--danger)', border: '1px solid rgba(239,68,68,0.35)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <ShieldAlert size={14} /> Admin
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {profileRoles?.length > 0 && (
+                    <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: 'var(--space-4)', padding: '10px 14px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', borderLeft: '3px solid var(--primary)' }}>
+                      ℹ️ Your role was assigned at signup and dictates your dashboard layout. It can only be changed by an administrator.
+                    </p>
+                  )}
                 </div>
 
                 {/* Editable profile fields */}
-                <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)' }}>
+                <div className="card-3d" style={{ backgroundColor: 'var(--bg-surface)', padding: 'var(--space-6)' }}>
+                  <h3 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 'var(--space-5)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Settings size={20} style={{ color: 'var(--primary)' }} /> Personal Details
+                  </h3>
                   <form onSubmit={handleUpdateProfile}>
-                    <div className="form-group">
-                      <label className="form-label">Full Name</label>
-                      <input 
-                        type="text" 
-                        required 
-                        value={profileName} 
-                        onChange={(e) => setProfileName(e.target.value)}
-                        className="form-input" 
-                      />
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-4)' }}>
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label">Full Name</label>
+                        <div style={{ position: 'relative' }}>
+                          <User size={18} style={{ position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                          <input 
+                            type="text" 
+                            required 
+                            value={profileName} 
+                            onChange={(e) => setProfileName(e.target.value)}
+                            className="form-input" 
+                            style={{ paddingLeft: '42px' }}
+                          />
+                        </div>
+                      </div>
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label">Phone Number</label>
+                        <div style={{ position: 'relative' }}>
+                          <Phone size={18} style={{ position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                          <input 
+                            type="text" 
+                            value={profilePhone || ''} 
+                            onChange={(e) => setProfilePhone(e.target.value)}
+                            className="form-input"
+                            placeholder="+91 XXXXX XXXXX"
+                            style={{ paddingLeft: '42px' }}
+                          />
+                        </div>
+                      </div>
                     </div>
-                    <div className="form-group">
-                      <label className="form-label">Phone Number</label>
-                      <input 
-                        type="text" 
-                        value={profilePhone || ''} 
-                        onChange={(e) => setProfilePhone(e.target.value)}
-                        className="form-input"
-                        placeholder="+91 XXXXX XXXXX"
-                      />
+                    
+                    <div style={{ marginTop: 'var(--space-6)', display: 'flex', justifyContent: 'flex-end' }}>
+                      <button type="submit" className="btn btn-primary btn-3d" disabled={loading} style={{ padding: '12px 30px', fontSize: '1rem' }}>
+                        {loading ? <RefreshCw className="spinner" size={18} /> : 'Save Changes'}
+                      </button>
                     </div>
-                    <button type="submit" className="btn btn-primary btn-3d" disabled={loading} style={{ marginTop: '10px' }}>
-                      {loading ? <RefreshCw className="spinner" size={16} /> : 'Save Changes'}
-                    </button>
                   </form>
                 </div>
               </div>
@@ -1744,7 +2105,7 @@ const Dashboard = () => {
       {/* ========================================================================= */}
       {showRequestModal && selectedRoute && (
         <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '16px' }}>
-          <div className="card-3d" style={{ maxWidth: '460px', width: '100%', backgroundColor: 'var(--bg-surface)' }}>
+          <div className="card-3d" style={{ maxWidth: '460px', width: '100%', maxHeight: '90vh', overflowY: 'auto', backgroundColor: 'var(--bg-surface)' }}>
             <h3 className="card-title">Book Courier Journey</h3>
             <p className="subtitle" style={{ fontSize: '0.85rem' }}>
               Carrier traveler: <strong>{selectedRoute.carrier?.name}</strong> routing from <strong>{selectedRoute.origin}</strong> to <strong>{selectedRoute.destination}</strong>.
@@ -1900,76 +2261,29 @@ const Dashboard = () => {
               );
             })()}
 
-            <form onSubmit={handleSimulatePayment}>
-              <div className="form-group">
-                <label className="form-label">Cardholder Name</label>
-                <input 
-                  type="text" 
-                  required 
-                  placeholder="Prince Dewangan" 
-                  value={paymentForm.cardholder}
-                  onChange={(e) => setPaymentForm({...paymentForm, cardholder: e.target.value})}
-                  className="form-input" 
-                />
-              </div>
-              <div className="form-group">
-                <label className="form-label">Card Number</label>
-                <input 
-                  type="text" 
-                  required 
-                  maxLength="16"
-                  placeholder="4000 1234 5678 9010" 
-                  value={paymentForm.cardNumber}
-                  onChange={(e) => setPaymentForm({...paymentForm, cardNumber: e.target.value.replace(/\D/g, '')})}
-                  className="form-input" 
-                />
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' }}>
-                <div className="form-group">
-                  <label className="form-label">Expiry (MM/YY)</label>
-                  <input 
-                    type="text" 
-                    required 
-                    maxLength="5"
-                    placeholder="12/29" 
-                    value={paymentForm.expiry}
-                    onChange={(e) => setPaymentForm({...paymentForm, expiry: e.target.value})}
-                    className="form-input" 
-                  />
-                </div>
-                <div className="form-group">
-                  <label className="form-label">CVV</label>
-                  <input 
-                    type="password" 
-                    required 
-                    maxLength="3"
-                    placeholder="123" 
-                    value={paymentForm.cvv}
-                    onChange={(e) => setPaymentForm({...paymentForm, cvv: e.target.value.replace(/\D/g, '')})}
-                    className="form-input" 
-                  />
-                </div>
-              </div>
-              
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px', backgroundColor: 'rgba(16,185,129,0.06)', borderRadius: 'var(--radius-sm)', marginBottom: '20px', color: 'var(--success)', fontSize: '0.75rem' }}>
-                <ShieldAlert size={16} style={{ flexShrink: 0 }} />
-                <span>Escrow Guarantee: Funds are only released to the carrier after you provide the Delivery OTP upon receipt.</span>
-              </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px', backgroundColor: 'rgba(16,185,129,0.06)', borderRadius: 'var(--radius-sm)', marginBottom: '20px', color: 'var(--success)', fontSize: '0.75rem' }}>
+              <ShieldAlert size={16} style={{ flexShrink: 0 }} />
+              <span>Escrow Guarantee: Funds are only released to the carrier after you provide the Delivery OTP upon receipt.</span>
+            </div>
 
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button type="submit" className="btn btn-success btn-primary btn-3d" style={{ flex: 1 }} disabled={loading}>
-                  {loading ? <RefreshCw className="spinner" size={16} /> : `Secure ₹${selectedBookingForPayment.price}`}
-                </button>
-                <button 
-                  type="button" 
-                  onClick={() => { setShowPaymentModal(false); setSelectedBookingForPayment(null); }} 
-                  className="btn btn-outline btn-3d" 
-                  style={{ flex: 1 }}
-                >
-                  Cancel
-                </button>
-              </div>
-            </form>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button 
+                onClick={handleRazorpayPayment} 
+                className="btn btn-success btn-primary btn-3d" 
+                style={{ flex: 1 }} 
+                disabled={loading}
+              >
+                {loading ? <RefreshCw className="spinner" size={16} /> : `Pay ₹${selectedBookingForPayment.price} securely`}
+              </button>
+              <button 
+                type="button" 
+                onClick={() => { setShowPaymentModal(false); setSelectedBookingForPayment(null); }} 
+                className="btn btn-outline btn-3d" 
+                style={{ flex: 1 }}
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1977,4 +2291,36 @@ const Dashboard = () => {
   );
 };
 
-export default Dashboard;
+class DashboardErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error('Dashboard crash:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: '40px', color: 'red', fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>
+          <h2>Dashboard Crashed</h2>
+          <p>{this.state.error?.message}</p>
+          <p>{this.state.error?.stack}</p>
+          <button onClick={() => this.setState({ hasError: false, error: null })}>Retry</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const DashboardWithBoundary = () => (
+  <DashboardErrorBoundary>
+    <Dashboard />
+  </DashboardErrorBoundary>
+);
+
+export default DashboardWithBoundary;

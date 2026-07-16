@@ -10,6 +10,8 @@ import Signup from './pages/Signup';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
 import Dashboard from './pages/Dashboard';
+import RouteSearch from './pages/RouteSearch';
+import RouteResults from './pages/RouteResults';
 
 // 404 Page
 const NotFound = () => {
@@ -50,9 +52,22 @@ function App() {
               </ProtectedRoute>
             } 
           />
-
-
-          {/* 404 Route */}
+          <Route 
+            path="/search" 
+            element={
+              <ProtectedRoute>
+                <RouteSearch />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/results" 
+            element={
+              <ProtectedRoute>
+                <RouteResults />
+              </ProtectedRoute>
+            } 
+          />          {/* 404 Route */}
           <Route path="*" element={<NotFound />} />
         </Routes>
       </Router>
